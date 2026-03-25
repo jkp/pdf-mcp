@@ -16,7 +16,7 @@ settings = Settings()
 
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(
-        structlog.get_level_from_name(settings.log_level)
+        structlog._log_levels.NAME_TO_LEVEL.get(settings.log_level.lower(), 20)
     ),
 )
 logger = structlog.get_logger()
@@ -75,7 +75,8 @@ def _build_app():
 
     _app = mcp.http_app(transport="http", stateless_http=True, path=settings.mcp_path)
 
-    @_app.route("/.well-known/oauth-protected-resource")
+    from starlette.routing import Route
+
     async def oauth_protected_resource(request):
         base = str(settings.oauth_base_url or f"http://{settings.host}:{settings.port}")
         return JSONResponse(
@@ -84,6 +85,10 @@ def _build_app():
                 "authorization_servers": [base],
             }
         )
+
+    _app.router.routes.append(
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource)
+    )
 
     return _app
 
