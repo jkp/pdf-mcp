@@ -1,10 +1,11 @@
-"""PDF search tools — FTS5 + semantic vector search."""
+"""PDF search tools — FTS5 + semantic vector search + reranker + relevance."""
 
 from typing import Any
 
 import structlog
 
-from pdf_mcp.server import db, embedder, mcp
+from pdf_mcp.relevance import score_relevance
+from pdf_mcp.server import db, embedder, mcp, settings
 
 logger = structlog.get_logger()
 
@@ -16,8 +17,8 @@ async def search_pdfs(
 ) -> list[dict[str, Any]]:
     """Search across all indexed PDFs using full-text and semantic search.
 
-    Combines FTS5 keyword matching with vector similarity search for
-    best results. Returns matching pages with snippets.
+    Combines FTS5 keyword matching with vector similarity search,
+    reranks with a cross-encoder, and filters by LLM relevance scoring.
 
     Args:
         query: Search query (natural language or keywords)
@@ -25,8 +26,8 @@ async def search_pdfs(
     """
     logger.info("tool.search_pdfs", query=query, limit=limit)
 
-    seen: set[str] = set()  # filename:page_num dedup key
-    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    candidates: list[dict[str, Any]] = []
 
     # Phase 1: Vector search (semantic)
     if embedder:
@@ -36,19 +37,17 @@ async def search_pdfs(
                 key = f"{r['filename']}:{r['page_num']}"
                 if key not in seen:
                     seen.add(key)
-                    # Fetch the page text snippet
                     pages = db.get_pages(r["filename"])
                     page_text = ""
                     for p in pages:
                         if p["page_num"] == r["page_num"]:
-                            page_text = p["text"][:200]
+                            page_text = p["text"][:500]
                             break
-                    results.append(
+                    candidates.append(
                         {
                             "filename": r["filename"],
                             "page_num": r["page_num"],
                             "snippet": page_text,
-                            "source": "semantic",
                         }
                     )
             logger.info("tool.search_pdfs.vector", hits=len(vec_results))
@@ -57,25 +56,44 @@ async def search_pdfs(
 
     # Phase 2: FTS5 keyword search
     try:
-        fts_results = db.search(query, limit=limit)
+        fts_results = db.search(query, limit=limit * 2)
         for r in fts_results:
             key = f"{r['filename']}:{r['page_num']}"
             if key not in seen:
                 seen.add(key)
-                results.append(
+                candidates.append(
                     {
                         "filename": r["filename"],
                         "page_num": r["page_num"],
                         "snippet": r.get("snippet", ""),
-                        "source": "keyword",
                     }
                 )
         logger.info("tool.search_pdfs.fts", hits=len(fts_results))
     except Exception as e:
         logger.warning("tool.search_pdfs.fts_error", error=str(e))
 
+    # Phase 3: Cross-encoder reranker
+    if embedder and candidates:
+        try:
+            ranked = embedder.rerank(query, candidates)
+            candidates = [c for _, c in ranked]
+            logger.info("tool.search_pdfs.reranked", count=len(candidates))
+        except Exception as e:
+            logger.warning("tool.search_pdfs.rerank_error", error=str(e))
+
+    results = candidates[:limit]
+
+    # Phase 4: LLM relevance filter
+    if results and settings.together_api_key:
+        try:
+            results = await score_relevance(
+                query, results, api_key=settings.together_api_key
+            )
+        except Exception as e:
+            logger.warning("tool.search_pdfs.relevance_error", error=str(e))
+
     logger.info("tool.search_pdfs.done", query=query, count=len(results))
-    return results[:limit]
+    return results
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "title": "List PDFs"})

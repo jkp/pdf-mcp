@@ -28,6 +28,7 @@ MODEL_NAME = "intfloat/multilingual-e5-large-instruct"
 EMBEDDING_DIMS = 1024
 _QUERY_PREFIX = "query: "
 _DOC_PREFIX = "passage: "
+_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 _API_BATCH_SIZE = 100
 
 
@@ -67,6 +68,7 @@ class Embedder:
         self._model_name = model_name
         self._together_key = api_key
         self._local_model = model
+        self._reranker = None
         self._ensure_table()
 
     @staticmethod
@@ -228,6 +230,37 @@ class Embedder:
                 break
 
         return results
+
+    def _ensure_reranker(self) -> None:
+        if self._reranker is None:
+            from sentence_transformers import CrossEncoder
+
+            logger.info("embedder.loading_reranker")
+            self._reranker = CrossEncoder(_RERANKER_MODEL)
+
+    def rerank(
+        self, query: str, candidates: list[dict[str, Any]]
+    ) -> list[tuple[float, dict[str, Any]]]:
+        """Score candidates using cross-encoder. Returns (score, result) sorted desc."""
+        if not candidates:
+            return []
+        self._ensure_reranker()
+        assert self._reranker is not None
+
+        pairs = []
+        for c in candidates:
+            doc = f"File: {c['filename']}\nPage {c['page_num']}\n\n{c.get('snippet', '')}"
+            pairs.append([query, doc])
+
+        scores = self._reranker.predict(pairs)
+        ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+
+        logger.info(
+            "embedder.reranked",
+            count=len(ranked),
+            top_score=f"{ranked[0][0]:.2f}" if ranked else None,
+        )
+        return ranked
 
     def get_unembedded(self, limit: int = 1000) -> list[str]:
         """Get filenames that have pages but aren't embedded yet."""
