@@ -10,6 +10,7 @@ from fastmcp import FastMCP
 
 from pdf_mcp.config import Settings
 from pdf_mcp.db import Database
+from pdf_mcp.embedder import Embedder
 from pdf_mcp.indexer import Indexer
 
 settings = Settings()
@@ -23,11 +24,14 @@ logger = structlog.get_logger()
 
 db = Database(settings.database_path)
 indexer = Indexer(db=db, vault=settings.vault)
+embedder: Embedder | None = None
 
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
-    """Index PDFs on startup, then serve."""
+    """Index PDFs on startup, embed, then serve."""
+    global embedder
+
     vault = settings.vault
     if not vault.is_dir():
         logger.warning("server.vault_not_found", path=str(vault))
@@ -37,8 +41,46 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
     stats = indexer.index_all()
     logger.info("server.indexed", **stats)
 
+    # Initialize embedder
+    try:
+        embedder = Embedder(db=db, api_key=settings.together_api_key)
+        logger.info("server.embedder_loaded")
+
+        # Embed any unembedded PDFs in background
+        import asyncio
+        import concurrent.futures
+        from functools import partial
+
+        async def _embed_loop() -> None:
+            assert embedder is not None
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="embedder")
+            loop = asyncio.get_event_loop()
+            try:
+                while True:
+                    filenames = embedder.get_unembedded(limit=50)
+                    if not filenames:
+                        await asyncio.sleep(30)
+                        continue
+                    use_api = len(filenames) >= 10
+                    count = await loop.run_in_executor(
+                        pool, partial(embedder.embed_batch, filenames, use_api=use_api)
+                    )
+                    logger.info("server.embed_progress", embedded=count, batch=len(filenames))
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+
+        embed_task = asyncio.create_task(_embed_loop(), name="embed_pdfs")
+    except Exception:
+        logger.warning("server.embedder_load_failed", exc_info=True)
+        embed_task = None
+
     logger.info("server.ready", vault=str(vault))
     yield
+
+    if embed_task:
+        embed_task.cancel()
     db.close()
     logger.info("server.shutdown")
 
