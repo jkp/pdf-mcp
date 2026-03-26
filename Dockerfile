@@ -5,7 +5,7 @@ COPY --from=uv /uv /usr/local/bin/uv
 
 # tesseract for OCR of scanned PDFs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr tesseract-ocr-eng \
+    tesseract-ocr tesseract-ocr-eng ghostscript \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
