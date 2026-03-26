@@ -115,7 +115,24 @@ class Indexer:
             removed += 1
             logger.info("indexer.removed", filename=gone)
 
-        # Index new/changed
+        # Find PDFs with no extracted text (need OCR retry)
+        needs_ocr = {
+            p["filename"]
+            for p in self._db.list_pdfs()
+            if p["filename"] in disk_files
+            and not self._db.get_pages(p["filename"])
+        }
+        # Force reindex by clearing their hash
+        for filename in needs_ocr:
+            self._db.execute(
+                "UPDATE pdfs SET file_hash = 'needs-ocr' WHERE filename = ?",
+                [filename],
+            )
+        if needs_ocr:
+            self._db.commit()
+            logger.info("indexer.ocr_retry", count=len(needs_ocr))
+
+        # Index new/changed/needs-OCR
         for filename in sorted(disk_files):
             try:
                 if self.index_file(filename):
