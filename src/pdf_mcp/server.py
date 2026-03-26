@@ -32,6 +32,10 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
     """Index PDFs on startup, embed, then serve."""
     global embedder
 
+    import asyncio
+    import concurrent.futures
+    from functools import partial
+
     vault = settings.vault
     if not vault.is_dir():
         logger.warning("server.vault_not_found", path=str(vault))
@@ -41,20 +45,21 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
     stats = indexer.index_all()
     logger.info("server.indexed", **stats)
 
+    # Keep strong references to background tasks so they don't get GC'd
+    background_tasks: list[asyncio.Task] = []
+
     # Initialize embedder
     try:
         embedder = Embedder(db=db, api_key=settings.together_api_key)
         logger.info("server.embedder_loaded")
 
-        # Embed any unembedded PDFs in background
-        import asyncio
-        import concurrent.futures
-        from functools import partial
-
         async def _embed_loop() -> None:
             assert embedder is not None
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="embedder")
-            loop = asyncio.get_event_loop()
+            pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="embedder"
+            )
+            ev_loop = asyncio.get_event_loop()
+            logger.info("server.embed_loop_started")
             try:
                 while True:
                     try:
@@ -68,8 +73,9 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
                             batch=len(filenames),
                             mode="api" if use_api else "local",
                         )
-                        count = await loop.run_in_executor(
-                            pool, partial(embedder.embed_batch, filenames, use_api=use_api)
+                        count = await ev_loop.run_in_executor(
+                            pool,
+                            partial(embedder.embed_batch, filenames, use_api=use_api),
                         )
                         logger.info(
                             "server.embed_progress",
@@ -83,33 +89,30 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
                 pool.shutdown(wait=False, cancel_futures=True)
                 raise
 
-        embed_task = asyncio.create_task(_embed_loop(), name="embed_pdfs")
+        background_tasks.append(asyncio.create_task(_embed_loop(), name="embed_pdfs"))
     except Exception:
         logger.warning("server.embedder_load_failed", exc_info=True)
-        embed_task = None
 
     # Periodic filesystem scan for new/changed PDFs (every 5 minutes)
-    _SCAN_INTERVAL = 300
-
     async def _scan_loop() -> None:
+        logger.info("server.scan_loop_started")
         while True:
-            await asyncio.sleep(_SCAN_INTERVAL)
+            await asyncio.sleep(300)
             try:
-                loop = asyncio.get_event_loop()
-                stats = await loop.run_in_executor(None, indexer.index_all)
-                if stats["indexed"] or stats["removed"]:
-                    logger.info("server.scan.changes", **stats)
+                ev_loop = asyncio.get_event_loop()
+                scan_stats = await ev_loop.run_in_executor(None, indexer.index_all)
+                if scan_stats["indexed"] or scan_stats["removed"]:
+                    logger.info("server.scan.changes", **scan_stats)
             except Exception as e:
                 logger.warning("server.scan.error", error=str(e))
 
-    scan_task = asyncio.create_task(_scan_loop(), name="scan_vault")
+    background_tasks.append(asyncio.create_task(_scan_loop(), name="scan_vault"))
 
-    logger.info("server.ready", vault=str(vault))
+    logger.info("server.ready", vault=str(vault), background_tasks=len(background_tasks))
     yield
 
-    scan_task.cancel()
-    if embed_task:
-        embed_task.cancel()
+    for task in background_tasks:
+        task.cancel()
     db.close()
     logger.info("server.shutdown")
 
