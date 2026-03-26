@@ -57,15 +57,27 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
             loop = asyncio.get_event_loop()
             try:
                 while True:
-                    filenames = embedder.get_unembedded(limit=50)
-                    if not filenames:
-                        await asyncio.sleep(30)
-                        continue
-                    use_api = len(filenames) >= 10
-                    count = await loop.run_in_executor(
-                        pool, partial(embedder.embed_batch, filenames, use_api=use_api)
-                    )
-                    logger.info("server.embed_progress", embedded=count, batch=len(filenames))
+                    try:
+                        filenames = embedder.get_unembedded(limit=50)
+                        if not filenames:
+                            await asyncio.sleep(30)
+                            continue
+                        use_api = len(filenames) >= 10
+                        logger.info(
+                            "server.embed_starting",
+                            batch=len(filenames),
+                            mode="api" if use_api else "local",
+                        )
+                        count = await loop.run_in_executor(
+                            pool, partial(embedder.embed_batch, filenames, use_api=use_api)
+                        )
+                        logger.info(
+                            "server.embed_progress",
+                            embedded=count,
+                            batch=len(filenames),
+                        )
+                    except Exception as e:
+                        logger.error("server.embed_error", error=str(e), exc_info=True)
                     await asyncio.sleep(1)
             except asyncio.CancelledError:
                 pool.shutdown(wait=False, cancel_futures=True)
