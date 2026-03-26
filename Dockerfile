@@ -3,6 +3,11 @@ FROM python:3.13-slim
 
 COPY --from=uv /uv /usr/local/bin/uv
 
+# tesseract for OCR of scanned PDFs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/

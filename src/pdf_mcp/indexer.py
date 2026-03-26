@@ -68,6 +68,18 @@ class Indexer:
                 # Update hash since OCR modified the file
                 file_hash = self._hash_file(path)
 
+        # Clean up old vectors and reset embedded flag if re-indexing a changed file
+        if existing:
+            try:
+                self._db.execute(
+                    "DELETE FROM pdf_vectors WHERE chunk_id LIKE ?", [f"{filename}:%"]
+                )
+                self._db.execute(
+                    "UPDATE pdfs SET embedded = 0 WHERE filename = ?", [filename]
+                )
+            except Exception:
+                pass  # pdf_vectors/embedded may not exist if embedder hasn't initialized
+
         # Store
         self._db.upsert_pdf(
             filename=filename,
