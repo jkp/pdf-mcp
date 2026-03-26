@@ -55,6 +55,19 @@ class Indexer:
         page_count = len(doc)
         doc.close()
 
+        # OCR scanned pages that had no extractable text
+        if not pages and page_count > 0:
+            if self._ocr_pdf(path):
+                # Re-extract after OCR modified the file
+                doc = pymupdf.open(str(path))
+                for i, page in enumerate(doc):
+                    text = page.get_text("text").strip()
+                    if text:
+                        pages.append((i + 1, text))
+                doc.close()
+                # Update hash since OCR modified the file
+                file_hash = self._hash_file(path)
+
         # Store
         self._db.upsert_pdf(
             filename=filename,
@@ -114,6 +127,27 @@ class Indexer:
             "failed": failed,
             "removed": removed,
         }
+
+    @staticmethod
+    def _ocr_pdf(path: Path) -> bool:
+        """Run OCR on a PDF, modifying it in-place. Returns True if successful."""
+        try:
+            import ocrmypdf
+
+            result = ocrmypdf.ocr(
+                str(path),
+                str(path),
+                skip_text=True,  # Don't re-OCR pages that already have text
+                progress_bar=False,
+            )
+            if result == 0:
+                logger.info("indexer.ocr_done", filename=path.name)
+                return True
+            logger.warning("indexer.ocr_failed", filename=path.name, code=result)
+            return False
+        except Exception as e:
+            logger.warning("indexer.ocr_error", filename=path.name, error=str(e))
+            return False
 
     @staticmethod
     def _hash_file(path: Path) -> str:
