@@ -56,6 +56,7 @@ class Indexer:
         doc.close()
 
         # OCR scanned pages that had no extractable text
+        ocr_failed = False
         if not pages and page_count > 0:
             if self._ocr_pdf(path):
                 # Re-extract after OCR modified the file
@@ -67,6 +68,15 @@ class Indexer:
                 doc.close()
                 # Update hash since OCR modified the file
                 file_hash = self._hash_file(path)
+                if not pages:
+                    ocr_failed = True
+                    logger.warning(
+                        "indexer.ocr_no_text",
+                        filename=filename,
+                        pages=page_count,
+                    )
+            else:
+                ocr_failed = True
 
         # Clean up old vectors and reset embedded flag if re-indexing a changed file
         if existing:
@@ -80,17 +90,24 @@ class Indexer:
             except Exception:
                 pass  # pdf_vectors/embedded may not exist if embedder hasn't initialized
 
-        # Store
+        # Store — use special hash prefix if OCR failed so we don't retry every cycle
+        store_hash = f"no-text:{file_hash}" if ocr_failed else file_hash
         self._db.upsert_pdf(
             filename=filename,
-            file_hash=file_hash,
+            file_hash=store_hash,
             page_count=page_count,
             title=title or None,
             author=author or None,
         )
         self._db.insert_pages(filename, pages)
 
-        logger.info("indexer.indexed", filename=filename, pages=page_count)
+        logger.info(
+            "indexer.indexed",
+            filename=filename,
+            pages=page_count,
+            text_pages=len(pages),
+            ocr_failed=ocr_failed,
+        )
         return True
 
     def index_all(self) -> dict[str, int]:
@@ -115,12 +132,14 @@ class Indexer:
             removed += 1
             logger.info("indexer.removed", filename=gone)
 
-        # Find PDFs with no extracted text (need OCR retry)
+        # Find PDFs with no extracted text that haven't already been OCR'd
+        # (skip files with "no-text:" hash prefix — OCR was tried and failed)
         needs_ocr = {
             p["filename"]
             for p in self._db.list_pdfs()
             if p["filename"] in disk_files
             and not self._db.get_pages(p["filename"])
+            and not p["file_hash"].startswith("no-text:")
         }
         # Force reindex by clearing their hash
         for filename in needs_ocr:
