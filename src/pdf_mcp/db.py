@@ -6,6 +6,7 @@ for full-text search across all indexed PDFs.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,23 @@ CREATE TRIGGER IF NOT EXISTS pages_au AFTER UPDATE ON pdf_pages BEGIN
     VALUES (new.rowid, new.filename, new.page_num, new.text);
 END;
 """
+
+
+def _sanitize_fts(text: str) -> str:
+    """Sanitize free-text for FTS5 MATCH.
+
+    Plain words get a trailing * for prefix matching (e.g. "invoice" → "invoice*").
+    Tokens with special chars are quoted. Already-quoted phrases left as-is.
+    """
+    tokens = []
+    for part in re.findall(r'"[^"]*"|\S+', text):
+        if part.startswith('"') and part.endswith('"'):
+            tokens.append(part)
+        elif re.search(r"[^\w\s]", part):
+            tokens.append(f'"{part}"')
+        else:
+            tokens.append(f"{part}*")
+    return " ".join(tokens)
 
 
 class Database:
@@ -149,7 +167,10 @@ class Database:
         """Full-text search across all indexed PDFs.
 
         Returns list of {filename, page_num, snippet} sorted by relevance.
+        Terms get prefix wildcards (e.g. "invoice" matches "invoiced").
+        FTS5 default is implicit AND — all terms must appear on the same page.
         """
+        fts_query = _sanitize_fts(query)
         try:
             rows = self._conn.execute(
                 """
@@ -159,7 +180,7 @@ class Database:
                 ORDER BY rank
                 LIMIT ?
                 """,
-                [query, limit],
+                [fts_query, limit],
             ).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.OperationalError:
