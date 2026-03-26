@@ -76,9 +76,26 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
         logger.warning("server.embedder_load_failed", exc_info=True)
         embed_task = None
 
+    # Periodic filesystem scan for new/changed PDFs (every 5 minutes)
+    _SCAN_INTERVAL = 300
+
+    async def _scan_loop() -> None:
+        while True:
+            await asyncio.sleep(_SCAN_INTERVAL)
+            try:
+                loop = asyncio.get_event_loop()
+                stats = await loop.run_in_executor(None, indexer.index_all)
+                if stats["indexed"] or stats["removed"]:
+                    logger.info("server.scan.changes", **stats)
+            except Exception as e:
+                logger.warning("server.scan.error", error=str(e))
+
+    scan_task = asyncio.create_task(_scan_loop(), name="scan_vault")
+
     logger.info("server.ready", vault=str(vault))
     yield
 
+    scan_task.cancel()
     if embed_task:
         embed_task.cancel()
     db.close()
