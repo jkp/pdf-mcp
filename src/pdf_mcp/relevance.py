@@ -11,7 +11,12 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-_MODEL = "mistralai/Mistral-Small-24B-Instruct-2501"
+# Mistral-Small-24B stopped being served serverless (HTTP 400 from 2026-10-07),
+# which silently disabled filtering. gpt-oss-120b at low effort is what
+# email-mcp moved to after a backtest; it reasons first, hence the headroom.
+_MODEL = "openai/gpt-oss-120b"
+_REASONING_EFFORT = "low"
+_REASONING_TOKENS = 1000
 _API_URL = "https://api.together.xyz/v1/chat/completions"
 _RELEVANCE_THRESHOLD = 3
 
@@ -96,10 +101,11 @@ async def _llm_score(prompt: str, api_key: str, count: int) -> list[int] | None:
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                "max_tokens": 100,
+                "max_tokens": max(100, count * 8) + _REASONING_TOKENS,
                 "temperature": 0.0,
+                "reasoning_effort": _REASONING_EFFORT,
             },
-            timeout=10,
+            timeout=20,
         )
 
     if resp.status_code != 200:
