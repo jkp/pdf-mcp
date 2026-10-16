@@ -117,23 +117,80 @@ async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
     logger.info("server.shutdown")
 
 
-def _build_auth():
+def _build_auth_storage(s: Settings):
+    """Persistent OAuth state (clients, codes, JTI mappings) under oauth_state_dir.
+
+    Without it FastMCP keeps them in memory, so every restart invalidates every
+    token it has issued.
+    """
+    if s.oauth_state_dir is None:
+        return None
+
+    from key_value.aio.stores.filetree import (
+        FileTreeStore,
+        FileTreeV1CollectionSanitizationStrategy,
+        FileTreeV1KeySanitizationStrategy,
+    )
+
+    state_dir = s.oauth_state_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("server.oauth_storage", path=str(state_dir))
+    return FileTreeStore(
+        data_directory=state_dir,
+        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(state_dir),
+        collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(state_dir),
+    )
+
+
+def _build_auth(s: Settings = settings):
     """Build OAuth auth provider if GitHub credentials are configured."""
-    if not settings.github_client_id or not settings.github_client_secret:
+    if not s.github_client_id or not s.github_client_secret:
         return None
 
     from fastmcp.server.auth.providers.github import GitHubProvider
 
     return GitHubProvider(
-        client_id=settings.github_client_id,
-        client_secret=settings.github_client_secret,
-        base_url=settings.oauth_base_url or f"http://localhost:{settings.port}",
+        client_id=s.github_client_id,
+        client_secret=s.github_client_secret,
+        base_url=s.oauth_base_url or f"http://localhost:{s.port}",
+        client_storage=_build_auth_storage(s),
     )
+
+
+def _build_middleware(s: Settings = settings):
+    """Admit only allowlisted GitHub users.
+
+    GitHub OAuth signs in any GitHub account, so with OAuth on, the allowlist is
+    the real protection: refuse to start without one rather than admit everyone.
+    """
+    if not s.github_client_id or not s.github_client_secret:
+        return []
+    allowed = {u.strip() for u in (s.oauth_allowed_users or "").split(",") if u.strip()}
+    if not allowed:
+        raise RuntimeError(
+            "GitHub OAuth is configured but PDF_MCP_OAUTH_ALLOWED_USERS is empty: "
+            "that would admit every GitHub user"
+        )
+
+    from fastmcp.server.middleware import AuthMiddleware
+
+    def require_allowed_user(ctx) -> bool:
+        if ctx.token is None:
+            logger.warning("auth.rejected", reason="no_token")
+            return False
+        login = ctx.token.claims.get("login", "")
+        if login in allowed:
+            return True
+        logger.warning("auth.rejected", login=login, reason="not_in_allowlist")
+        return False
+
+    return [AuthMiddleware(auth=require_allowed_user)]
 
 
 mcp = FastMCP(
     name="PDF Filing Cabinet",
     auth=_build_auth(),
+    middleware=_build_middleware(),
     lifespan=_lifespan,
 )
 
